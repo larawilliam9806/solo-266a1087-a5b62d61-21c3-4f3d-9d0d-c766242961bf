@@ -248,8 +248,7 @@ def test_empty_sample_outputs_are_visible(client, builders, sheet):
     assert empty.text == ""
 
 
-def test_restart_recovers_half_finished_version(client, builders, sheet, data_dir, monkeypatch):
-    import sys
+def test_restart_recovers_half_finished_version(client, builders, sheet, data_dir):
     from app import service
 
     rows = [("s1", "AAAAAAAA")]
@@ -302,23 +301,34 @@ def test_restart_after_failed_first_upload_exposes_nothing_ready(client, data_di
 
 
 def test_in_flight_processing_version_blocks_correction(client, builders, sheet):
+    import time
+
     from app import service
 
     r1, r2 = builders.pair("x", "AAAAAAAA")
     _upload(client, "runS", r1, r2, sheet([("s1", "AAAAAAAA")]))
 
-    # Simulate another worker that has already inserted an in-flight v2.
+    # Simulate another worker that has already inserted an in-flight v2 whose
+    # lease is still fresh: it must block a competing correction.
     conn = service.database.connect()
     conn.execute(
-        "INSERT INTO versions(run_id, version, status) VALUES ('runS', 2, 'processing')"
+        "INSERT INTO versions(run_id, version, status, worker_id, heartbeat_at) "
+        "VALUES ('runS', 2, 'processing', 'other-worker', ?)",
+        (time.time(),),
     )
     conn.close()
 
     resp = _correct(client, "runS", 1, sheet([("s1", "AAAAAAAT")]))
     assert resp.status_code == 409
     assert "in progress" in resp.json()["detail"]
-    # Current version untouched.
+    # Current version and the live processing row are untouched.
     assert client.get("/runs/runS").json()["current_version"] == 1
+    conn = service.database.connect()
+    row = conn.execute(
+        "SELECT status, worker_id FROM versions WHERE run_id='runS' AND version=2"
+    ).fetchone()
+    conn.close()
+    assert row["status"] == "processing" and row["worker_id"] == "other-worker"
 
 
 def test_failed_version_does_not_block_fresh_correction(client, builders, sheet):

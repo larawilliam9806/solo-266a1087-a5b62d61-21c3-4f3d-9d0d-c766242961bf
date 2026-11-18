@@ -27,8 +27,14 @@
 7. 原子性与恢复：
    - 结果先写入 `vN.tmp/`，全部 flush + fsync 后原子 rename；
    - 输入校验失败或写盘失败不改变当前版，半成品目录立即清除；
-   - 重启时所有残留 `processing` 版本标记为 `failed` 并清理 `.tmp`，
-     当前版回退到最近的就绪版，绝不暴露半成品。
+   - 每个执行中的版本由所属 worker 持有**租约**（`worker_id` + 心跳
+     `heartbeat_at`，默认每 2s 续租、30s 无心跳视为失效）；
+   - 重启时只清理租约失效（worker 确已死亡）的 `processing` 版本：标记
+     `failed`、清除 `.tmp` 与样本表副本，当前版回退到最近的就绪版；
+     心跳仍新鲜的在途更正属于存活 worker，**绝不清理**；
+   - 发布前在写事务内重新确认本 worker 仍持有该版本，且磁盘上样本文件、
+     未分配文件与即将落库的计数构成同一完整版本，二者齐备才推进
+     `current_ver`；被回收的迟到执行者不能重新发布失败版本。
 
 ## 目录与数据布局
 
@@ -100,6 +106,8 @@ curl http://localhost:8000/health
 
 数据持久化在命名卷 `demux-data`（容器内 `/data`）。调整上传大小上限可设置环境变量
 `DEMUX_MAX_UPLOAD_BYTES`，数据目录由 `DEMUX_DATA_DIR` 控制（默认 `/data`）。
+租约参数由 `DEMUX_HEARTBEAT_SECONDS`（默认 2）与 `DEMUX_LEASE_TIMEOUT_SECONDS`
+（默认 30）控制：租约超时应显著大于心跳间隔，多 worker 共用同一数据卷时无需额外配置。
 
 ## 本地开发与测试
 
@@ -113,12 +121,23 @@ DEMUX_DATA_DIR=./data uvicorn app.main:app --reload
 ## 并发与可靠性说明
 
 - SQLite 开启 WAL、`busy_timeout=30s`，所有写操作使用 `BEGIN IMMEDIATE` 短事务。
+- 执行中的版本（首次上传与每次更正）带有租约：所属 worker 的后台心跳线程每
+  `DEMUX_HEARTBEAT_SECONDS` 刷新 `versions.heartbeat_at`。另一个 worker 启动或
+  发起更正时，只回收心跳超过 `DEMUX_LEASE_TIMEOUT_SECONDS` 的失效租约——
+  正在执行的更正不会被误判为中断，确已中断（进程死亡）的更正才会标记 `failed`
+  并清除其 `.tmp`、结果目录与样本表副本。
 - 同运行的更正由两层机制保证「同版并发只一份生效」：
   1. 进程内按 `run_id` 加锁，串行化单 worker 内的请求；
   2. 多 worker/多进程部署时，在数据库写锁内检查是否已存在版本号更大的
      `processing`/`ready` 行（`runs.current_ver` 在重拆完成后才更新，
      因此用在途版本行识别并发），失败者整体回滚且不留 `failed` 行，直接返回 `409`。
   历史上崩溃留下的 `failed` 版本不拦截新的更正。
+- 发布在一个写事务内完成「所有权复核 + 计数落库 + 推进 `current_ver`」：
+  1. 只有仍由本 worker 持有的 `processing` 行可以转为 `ready`，行已被回收的
+     迟到执行者收到 `409` 并丢弃自己的输出，失败版本不会被重新发布；
+  2. 事务开启前先校验最终目录包含每个样本的 R1/R2 与两份未分配文件，磁盘文件
+     与数据库计数必须对应同一完整版本，否则整个版本失败、当前版不动；
+  3. `current_ver` 只在该事务内前移，旧版文件原样保留、始终可读。
 - 输出文件整目录原子替换（`rename` + 目录 fsync），数据库状态与文件可见性一致：
   只有 `ready` 版本提供下载，`failed`/`processing` 一律 `409`。
 - 原始 FASTQ 与每版样本表永久保留，任何更正都从原始读段重新拆分，不依赖历史输出。

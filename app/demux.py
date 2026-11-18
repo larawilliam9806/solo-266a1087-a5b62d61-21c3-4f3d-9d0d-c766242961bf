@@ -152,6 +152,17 @@ def demultiplex(
         raise StorageError(f"cannot prepare output directory {tmp_dir}: {exc}") from exc
 
     try:
+        # Test/injection hook: fires once the output tmp directory exists but
+        # before any record is processed.  Kept inside the try so a raising
+        # hook still triggers the normal tmp cleanup.
+        on_tmp_ready = globals().get("_ON_TMP_READY")
+        if on_tmp_ready is not None:
+            try:
+                on_tmp_ready(tmp_dir)
+            except Exception:
+                _close_quietly(r1_handles, r2_handles, und_r1, und_r2)
+                _safe_rmtree(tmp_dir)
+                raise
         r1_iter = _iter_records(r1_path, "R1")
         r2_iter = _iter_records(r2_path, "R2")
         while True:

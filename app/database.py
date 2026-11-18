@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS versions (
     unassigned_pairs  INTEGER NOT NULL DEFAULT 0,
     far_pairs         INTEGER NOT NULL DEFAULT 0,
     tie_pairs         INTEGER NOT NULL DEFAULT 0,
+    worker_id         TEXT,
+    heartbeat_at      REAL,
     PRIMARY KEY (run_id, version),
     FOREIGN KEY (run_id) REFERENCES runs(run_id)
 );
@@ -64,6 +66,18 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add lease columns to databases created before the liveness work."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(versions)").fetchall()}
+    if "worker_id" not in cols:
+        conn.execute("ALTER TABLE versions ADD COLUMN worker_id TEXT")
+    if "heartbeat_at" not in cols:
+        # NULL heartbeat marks rows written by versions without a heartbeat;
+        # they are treated as stale (recoverable), preserving old semantics.
+        conn.execute("ALTER TABLE versions ADD COLUMN heartbeat_at REAL")
 
 
 @contextmanager

@@ -7,6 +7,16 @@ services:
       - "8000:8000"
     environment:
       DEMUX_DATA_DIR: /data
+      # Multiple worker processes share the data volume; processing leases
+      # (heartbeat columns) keep each worker's recovery from touching another
+      # worker's in-flight corrections.
+      DEMUX_UVICORN_WORKERS: ${DEMUX_UVICORN_WORKERS:-1}
+      DEMUX_HEARTBEAT_SECONDS: ${DEMUX_HEARTBEAT_SECONDS:-2}
+      DEMUX_LEASE_TIMEOUT_SECONDS: ${DEMUX_LEASE_TIMEOUT_SECONDS:-30}
+    command:
+      - sh
+      - -c
+      - "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers $${DEMUX_UVICORN_WORKERS}"
     volumes:
       - demux-data:/data
     restart: unless-stopped
